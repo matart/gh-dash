@@ -25,7 +25,8 @@ const SectionType = "pr"
 
 type Model struct {
 	section.BaseModel
-	Prs []prrow.Data
+	Prs        []prrow.Data
+	PostFilter data.PRPostFilter
 }
 
 func NewModel(
@@ -50,6 +51,10 @@ func NewModel(
 		},
 	)
 	m.Prs = []prrow.Data{}
+	m.PostFilter = data.PRPostFilter{
+		ApprovalsLessThan: cfg.ApprovalsLessThan,
+		NotReviewedByMe:   cfg.NotReviewedByMe,
+	}
 
 	return m
 }
@@ -492,9 +497,14 @@ func (m *Model) FetchNextPageSectionRows() []tea.Cmd {
 			}
 		}
 
-		prs := make([]prrow.Data, 0)
-		for _, pr := range res.Prs {
+		filteredPrs := m.PostFilter.Apply(res.Prs)
+		prs := make([]prrow.Data, 0, len(filteredPrs))
+		for _, pr := range filteredPrs {
 			prs = append(prs, prrow.Data{Primary: &pr})
+		}
+		totalCount := res.TotalCount
+		if !m.PostFilter.IsZero() {
+			totalCount = len(filteredPrs)
 		}
 		return constants.TaskFinishedMsg{
 			SectionId:   m.Id,
@@ -502,7 +512,7 @@ func (m *Model) FetchNextPageSectionRows() []tea.Cmd {
 			TaskId:      taskId,
 			Msg: SectionPullRequestsFetchedMsg{
 				Prs:        prs,
-				TotalCount: res.TotalCount,
+				TotalCount: totalCount,
 				PageInfo:   res.PageInfo,
 				TaskId:     taskId,
 			},
