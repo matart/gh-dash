@@ -59,6 +59,46 @@ func TestIsEnrichmentCacheCleared(t *testing.T) {
 	})
 }
 
+func TestNeedsAdvancedSearch(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+		want  bool
+	}{
+		{"plain author", "is:open author:dlvhdr", false},
+		{"plain assignee", "is:pr assignee:foo", false},
+		{"author containing 'or' substring", "author:operator", false},
+		{"author with literal hyphen-or", "author:foo-or-bar", false},
+		{"OR uppercase", "is:open (author:a OR author:b)", true},
+		{"AND uppercase", "is:open (label:bug AND label:p0)", true},
+		{"NOT uppercase", "is:open NOT label:wontfix", true},
+		{"parens alone", "is:open (author:a)", true},
+		{"lowercase or not boolean", "is:open author:a or author:b", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			require.Equal(t, c.want, needsAdvancedSearch(c.query))
+		})
+	}
+}
+
+func TestStripSortQualifiers(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"is:open author:me sort:updated", "is:open author:me"},
+		{"is:open sort:updated-desc author:me", "is:open author:me"},
+		{"sort:created-asc is:open", "is:open"},
+		{"is:open author:me", "is:open author:me"},
+		{"is:open sort:updated sort:reactions-desc", "is:open"},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			require.Equal(t, c.want, stripSortQualifiers(c.in))
+		})
+	}
+}
+
 func TestSetClient(t *testing.T) {
 	// Save original state
 	originalClient := client
