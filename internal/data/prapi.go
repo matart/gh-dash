@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"charm.land/log/v2"
@@ -505,31 +508,65 @@ func IsEnrichmentCacheCleared() bool {
 	return cachedClient == nil
 }
 
-func FetchPullRequests(query string, limit int, pageInfo *PageInfo) (PullRequestsResponse, error) {
-	var err error
-	if client == nil {
-		if config.IsFeatureEnabled(config.FF_MOCK_DATA) {
-			log.Info("using mock data", "server", "https://localhost:3000")
-			http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{
-				InsecureSkipVerify: true,
-			}
-			client, err = gh.NewGraphQLClient(
-				gh.ClientOptions{Host: "localhost:3000", AuthToken: "fake-token"},
-			)
-		} else {
-			level := os.Getenv("LOG_LEVEL")
-			opts := gh.ClientOptions{}
-			if level == "debug" {
-				logger := NewHTTPLogger(0)
-				opts.Log = &logger
-				opts.LogVerboseHTTP = true
-				opts.LogColorize = true
-			}
-			client, err = gh.NewGraphQLClient(opts)
-		}
+// needsAdvancedSearch reports whether a search query uses boolean operators or
+// parentheses. Such queries must go through GitHub's REST search with
+// advanced_search=true, because the GraphQL search endpoint silently returns
+// zero results for them.
+func needsAdvancedSearch(query string) bool {
+	if strings.ContainsAny(query, "()") {
+		return true
 	}
+	padded := " " + query + " "
+	return strings.Contains(padded, " OR ") ||
+		strings.Contains(padded, " AND ") ||
+		strings.Contains(padded, " NOT ")
+}
 
-	if err != nil {
+var sortQualifierPattern = regexp.MustCompile(`\s*\bsort:\S+`)
+
+// stripSortQualifiers removes any sort:* tokens from a search query so the REST
+// path can pass sort as a dedicated query parameter instead.
+func stripSortQualifiers(query string) string {
+	return strings.TrimSpace(sortQualifierPattern.ReplaceAllString(query, ""))
+}
+
+func ensureGraphQLClient() error {
+	if client != nil {
+		return nil
+	}
+	var err error
+	if config.IsFeatureEnabled(config.FF_MOCK_DATA) {
+		log.Info("using mock data", "server", "https://localhost:3000")
+		http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+		client, err = gh.NewGraphQLClient(
+			gh.ClientOptions{Host: "localhost:3000", AuthToken: "fake-token"},
+		)
+	} else {
+		level := os.Getenv("LOG_LEVEL")
+		opts := gh.ClientOptions{}
+		if level == "debug" {
+			logger := NewHTTPLogger(0)
+			opts.Log = &logger
+			opts.LogVerboseHTTP = true
+			opts.LogColorize = true
+		}
+		client, err = gh.NewGraphQLClient(opts)
+	}
+	return err
+}
+
+func FetchPullRequests(query string, limit int, pageInfo *PageInfo) (PullRequestsResponse, error) {
+	fullQuery := makePullRequestsQuery(query)
+	if needsAdvancedSearch(fullQuery) {
+		return fetchPullRequestsViaREST(fullQuery, limit, pageInfo)
+	}
+	return fetchPullRequestsViaGraphQL(query, fullQuery, limit, pageInfo)
+}
+
+func fetchPullRequestsViaGraphQL(rawQuery, fullQuery string, limit int, pageInfo *PageInfo) (PullRequestsResponse, error) {
+	if err := ensureGraphQLClient(); err != nil {
 		return PullRequestsResponse{}, err
 	}
 
@@ -547,13 +584,12 @@ func FetchPullRequests(query string, limit int, pageInfo *PageInfo) (PullRequest
 		endCursor = &pageInfo.EndCursor
 	}
 	variables := map[string]any{
-		"query":     graphql.String(makePullRequestsQuery(query)),
+		"query":     graphql.String(fullQuery),
 		"limit":     graphql.Int(limit),
 		"endCursor": (*graphql.String)(endCursor),
 	}
-	log.Debug("Fetching PRs", "query", query, "limit", limit, "endCursor", endCursor)
-	err = client.Query("SearchPullRequests", &queryResult, variables)
-	if err != nil {
+	log.Debug("Fetching PRs", "query", rawQuery, "limit", limit, "endCursor", endCursor)
+	if err := client.Query("SearchPullRequests", &queryResult, variables); err != nil {
 		return PullRequestsResponse{}, err
 	}
 	log.Info("Successfully fetched PRs", "count", queryResult.Search.IssueCount)
@@ -568,6 +604,108 @@ func FetchPullRequests(query string, limit int, pageInfo *PageInfo) (PullRequest
 		TotalCount: queryResult.Search.IssueCount,
 		PageInfo:   queryResult.Search.PageInfo,
 	}, nil
+}
+
+type restPRSearchItem struct {
+	NodeID string `json:"node_id"`
+}
+
+type restPRSearchResponse struct {
+	TotalCount        int                `json:"total_count"`
+	IncompleteResults bool               `json:"incomplete_results"`
+	Items             []restPRSearchItem `json:"items"`
+}
+
+func fetchPullRequestsViaREST(fullQuery string, limit int, pageInfo *PageInfo) (PullRequestsResponse, error) {
+	if config.IsFeatureEnabled(config.FF_MOCK_DATA) {
+		return PullRequestsResponse{}, fmt.Errorf(
+			"boolean search queries (OR/AND/NOT/parentheses) are not supported in mock-data mode",
+		)
+	}
+
+	restCli, err := getRESTClient()
+	if err != nil {
+		return PullRequestsResponse{}, err
+	}
+
+	page := 1
+	if pageInfo != nil && pageInfo.EndCursor != "" {
+		if n, perr := strconv.Atoi(pageInfo.EndCursor); perr == nil && n > 0 {
+			page = n
+		}
+	}
+
+	queryForREST := stripSortQualifiers(fullQuery)
+	path := fmt.Sprintf(
+		"search/issues?advanced_search=true&type=pr&sort=updated&order=desc&per_page=%d&page=%d&q=%s",
+		limit, page, url.QueryEscape(queryForREST),
+	)
+	log.Debug("Fetching PRs via REST", "query", queryForREST, "limit", limit, "page", page)
+
+	var resp restPRSearchResponse
+	if err := restCli.Get(path, &resp); err != nil {
+		return PullRequestsResponse{}, err
+	}
+
+	ids := make([]string, 0, len(resp.Items))
+	for _, item := range resp.Items {
+		if item.NodeID != "" {
+			ids = append(ids, item.NodeID)
+		}
+	}
+
+	prs, err := hydratePullRequestsByID(ids)
+	if err != nil {
+		return PullRequestsResponse{}, err
+	}
+	log.Info("Successfully fetched PRs via REST", "count", resp.TotalCount, "page", page, "returned", len(prs))
+
+	hasNext := len(resp.Items) >= limit
+	return PullRequestsResponse{
+		Prs:        prs,
+		TotalCount: resp.TotalCount,
+		PageInfo: PageInfo{
+			HasNextPage: hasNext,
+			EndCursor:   strconv.Itoa(page + 1),
+		},
+	}, nil
+}
+
+// hydratePullRequestsByID fetches full PullRequestData for a list of node IDs
+// via a single GraphQL nodes(ids:) lookup. Order matches the input slice; nil
+// entries (deleted PRs) are dropped.
+func hydratePullRequestsByID(ids []string) ([]PullRequestData, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if err := ensureGraphQLClient(); err != nil {
+		return nil, err
+	}
+
+	var queryResult struct {
+		Nodes []*struct {
+			PullRequest PullRequestData `graphql:"... on PullRequest"`
+		} `graphql:"nodes(ids: $ids)"`
+	}
+
+	gqlIDs := make([]graphql.ID, 0, len(ids))
+	for _, id := range ids {
+		gqlIDs = append(gqlIDs, graphql.ID(id))
+	}
+
+	variables := map[string]any{"ids": gqlIDs}
+	if err := client.Query("HydratePullRequests", &queryResult, variables); err != nil {
+		return nil, err
+	}
+
+	prs := make([]PullRequestData, 0, len(queryResult.Nodes))
+	for _, node := range queryResult.Nodes {
+		if node == nil {
+			continue
+		}
+		prs = append(prs, node.PullRequest)
+	}
+	return prs, nil
 }
 
 func FetchPullRequest(prUrl string) (EnrichedPullRequestData, error) {
