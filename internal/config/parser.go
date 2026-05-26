@@ -89,11 +89,13 @@ type SectionConfig struct {
 }
 
 type PrsSectionConfig struct {
-	Title   string
-	Filters string
-	Limit   *int            `yaml:"limit,omitempty"`
-	Layout  PrsLayoutConfig `yaml:"layout,omitempty"`
-	Type    *ViewType       `yaml:"type,omitempty"`
+	Title             string
+	Filters           string
+	Limit             *int            `yaml:"limit,omitempty"`
+	Layout            PrsLayoutConfig `yaml:"layout,omitempty"`
+	Type              *ViewType       `yaml:"type,omitempty"`
+	ApprovalsLessThan int             `yaml:"approvalsLessThan,omitempty"`
+	NotReviewedByMe   bool            `yaml:"notReviewedByMe,omitempty"`
 }
 
 type IssuesSectionConfig struct {

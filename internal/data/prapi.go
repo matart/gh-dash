@@ -90,17 +90,23 @@ type PullRequestData struct {
 	HeadRef struct {
 		Name string
 	}
-	Repository       Repository
-	Assignees        Assignees            `graphql:"assignees(first: 3)"`
-	Comments         Comments             `graphql:"comments"`
-	ReviewThreads    ReviewThreads        `graphql:"reviewThreads"`
-	Reviews          ReviewsNumber        `graphql:"reviews"`
-	ReviewRequests   ReviewRequestsNumber `graphql:"reviewRequests"`
-	IsDraft          bool
-	IsInMergeQueue   bool
-	Commits          LastCommitStatus `graphql:"commits(last: 1)"`
-	Labels           PRLabels         `graphql:"labels(first: 6)"`
-	MergeStateStatus MergeStateStatus `graphql:"mergeStateStatus"`
+	Repository         Repository
+	Assignees          Assignees            `graphql:"assignees(first: 3)"`
+	Comments           Comments             `graphql:"comments"`
+	ReviewThreads      ReviewThreads        `graphql:"reviewThreads"`
+	Reviews            ReviewsNumber        `graphql:"reviews"`
+	ApprovingReviews   ReviewsNumber        `graphql:"approvingReviews: reviews(states: [APPROVED])"`
+	ViewerLatestReview *ViewerReview        `graphql:"viewerLatestReview"`
+	ReviewRequests     ReviewRequestsNumber `graphql:"reviewRequests"`
+	IsDraft            bool
+	IsInMergeQueue     bool
+	Commits            LastCommitStatus `graphql:"commits(last: 1)"`
+	Labels             PRLabels         `graphql:"labels(first: 6)"`
+	MergeStateStatus   MergeStateStatus `graphql:"mergeStateStatus"`
+}
+
+type ViewerReview struct {
+	State string
 }
 
 type LastCommitStatus struct {
